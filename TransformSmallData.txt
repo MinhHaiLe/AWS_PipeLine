@@ -1,0 +1,102 @@
+import boto3
+import pandas as pd
+import logging
+from io import StringIO, BytesIO
+from datetime import datetime
+import re
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+s3 = boto3.client('s3')
+
+def lambda_handler(event, context):
+    try:
+        year = str(datetime.now().year)
+        month = datetime.now().month
+        day = datetime.now().day
+        month_str = str(month) if month >= 10 else '0' + str(month)
+        day_str = str(day) if day >= 10 else '0' + str(day)
+        prefix = f"{year}/{month_str}/{day_str}/"
+
+        input_bucket = 'your-s3-bucket'
+        input_prefix = f'Raw-data/{prefix}'
+        output_bucket = 'your-s3-bucket'
+        output_prefix = f'Cleaned-data/{prefix}'
+
+        response = s3.list_objects_v2(Bucket=input_bucket, Prefix=input_prefix)
+        if 'Contents' not in response:
+            logger.warning("No files found in the input path.")
+            return
+
+        all_dfs = []
+
+        for obj in response['Contents']:
+            if obj['Key'].endswith('.csv'):
+                csv_obj = s3.get_object(Bucket=input_bucket, Key=obj['Key'])
+                csv_content = csv_obj['Body'].read().decode('utf-8')
+                df = pd.read_csv(StringIO(csv_content))
+                all_dfs.append(df)
+
+        if not all_dfs:
+            logger.warning("No CSV files found in the input path.")
+            return
+
+        df = pd.concat(all_dfs, ignore_index=True)
+
+        logger.info("Initial data schema:")
+        logger.info(df.dtypes)
+
+        if 'reserve_no' in df.columns:
+            df = df.drop(columns=['reserve_no'])
+
+        df = df.dropna()
+
+        df['slno'] = df['slno'].apply(lambda x: re.sub(r'\.0$', '', str(x)))
+        df['regvalidfrom'] = pd.to_datetime(df['regvalidfrom'], format='%d/%m/%Y', errors='coerce').dt.date
+        df['regvalidto'] = pd.to_datetime(df['regvalidto'], errors='coerce').dt.tz_localize(None)
+
+        df['seatCapacity'] = df['seatCapacity'].apply(lambda x: re.sub(r'\.0$', '', str(x))).astype(int)
+        df['cylinder'] = df['cylinder'].apply(lambda x: re.sub(r'\.0$', '', str(x))).astype(int)
+        df['Active_Duration'] = (df['regvalidto'] - pd.to_datetime(df['regvalidfrom'])).dt.days
+
+        df = df[(df['regvalidfrom'] >= datetime(1582, 10, 15).date()) & (df['regvalidto'] >= '1900-01-01')]
+
+        mapping = {
+            'slno': str,
+            'registrationNo': str,
+            'regvalidfrom': 'object',
+            'regvalidto': 'object',
+            'Active_Duration': int,
+            'makerName': str,
+            'bodyType': str,
+            'cc': float,
+            'cylinder': int,
+            'fuel': str,
+            'hp': float,
+            'seatCapacity': int
+        }
+        df = df.astype(mapping)
+
+        logger.info("Sample records after mapping:")
+        logger.info(df.head())
+
+        logger.info("Schema of dataframe before writing:")
+        logger.info(df.dtypes)
+
+        out_buffer = BytesIO()
+        df.to_parquet(out_buffer, index=False)
+        out_buffer.seek(0)
+
+        output_path = f'{output_prefix}output.parquet'
+        s3.put_object(Bucket=output_bucket, Key=output_path, Body=out_buffer)
+        logger.info("Write operation completed successfully.")
+
+    except Exception as e:
+        logger.error(f"Error processing file: {e}")
+        raise e
+
+    return {
+        'statusCode': 200,
+        'body': f'Successfully processed and uploaded file to {output_bucket}/{output_path}'
+    }

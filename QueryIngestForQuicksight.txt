@@ -1,0 +1,50 @@
+import json
+import boto3
+from datetime import datetime
+
+def lambda_handler(event, context):
+    athena_client = boto3.client("athena")
+    
+    query = """
+        SELECT * FROM "AwsDataCatalog"."your-database"."cleaned_data" WHERE active_duration >5475 
+        AND bodytype IN (
+            SELECT bodytype 
+            FROM "AwsDataCatalog"."your-database"."cleaned_data"
+            GROUP BY bodytype
+            HAVING count(bodytype)>100
+        )
+    """
+    year = str(datetime.now().year)
+    month = datetime.now().month
+    day = datetime.now().day
+    month_str = str(month) if month >= 10 else '0' + str(month)
+    day_str = str(day) if day >= 10 else '0' + str(day)
+    prefix = f"{year}/{month_str}/{day_str}/"
+
+    query_output = f"s3://your-s3/Queries/{prefix}"
+    
+    print(f"Query Output: {query_output}")
+    
+    try:
+        response = athena_client.start_query_execution(
+             QueryString=query,
+             QueryExecutionContext={
+                 "Database": "your-database"
+             },
+             ResultConfiguration={
+                 "OutputLocation": "s3://your-s3/"
+             }
+        )
+        query_execution_id = response['QueryExecutionId']
+        
+        return {
+            "statuscode": 200,
+            'query_execution_id': query_execution_id
+        }
+    except Exception as e:
+        sns_client = boto3.client('sns')
+        sns_client.publish(
+            TopicArn="arn:your-arn:your-notification-PipelineNotification",
+            Message=f"Error Querying ({type(e).__name__}): {str(e)}"
+        )
+        raise e
